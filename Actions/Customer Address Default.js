@@ -7,16 +7,23 @@
  * @trigger-show-in-ui true
  *
  * Checks whether a delivery/shipping address is set on a Sales Order header.
- * If no usable address is present, it falls back to the customer's default
- * address (looked up via the Address model, then the Customer model) and
- * writes those values back onto the transaction header.
+ *
+ * Case 1 – address_line_1 is missing:
+ *   Falls back to the customer's default address and writes all available
+ *   fields onto the transaction header (merging with any existing values).
+ *
+ * Case 2 – address_line_1 is present but addressee / address_line_3 / city /
+ *   postcode is blank:
+ *   Looks up the customer's default address. If its address_line_1 matches
+ *   the header's address_line_1 (case-insensitive trim), replaces the entire
+ *   address with the customer default. If it does not match, does nothing.
  */
 
 const handle = async (providedData) => {
   const { payload } = providedData;
 
   const model = _.get(payload, "resource.model");
-  const uuid = _.get(payload, "resource.uuid");
+  const uuid  = _.get(payload, "resource.uuid");
 
   if (!model || !uuid) {
     logger.warn("Missing model or uuid");
@@ -24,30 +31,43 @@ const handle = async (providedData) => {
   }
 
   const zmodel = await Model.load(payload.resource);
-  const data = zmodel.data();
+  const data   = zmodel.data();
 
   logger.info("Data", data);
 
- // --- Determine whether the header already has a usable address -----------
-  // The order is considered to have an address if address_line_1 is present.
-  // We only fall back to the customer default when it is missing
-  // (null / empty / whitespace).
+  // -------------------------------------------------------------------------
+  // Determine which scenario applies
+  // -------------------------------------------------------------------------
   const isBlank = (v) => v == null || String(v).trim() === "";
 
-  const headerMissingAddress =
-    isBlank(_.get(data, "address_line_1"));
+  const headerMissingAddress = isBlank(_.get(data, "address_line_1"));
 
-  if (!headerMissingAddress) {
-    logger.info(
-      "Sales order already has address_line_1; no default required",
+  const headerHasIncompleteAddress =
+    !headerMissingAddress &&
+    (
+      isBlank(_.get(data, "addressee"))      ||
+      isBlank(_.get(data, "address_line_3")) ||
+      isBlank(_.get(data, "city"))           ||
+      isBlank(_.get(data, "postcode"))
     );
+
+  if (!headerMissingAddress && !headerHasIncompleteAddress) {
+    logger.info("Sales order already has a complete address; no default required");
     return;
   }
 
-  logger.info("No usable address on sales order; resolving customer default");
+  if (headerMissingAddress) {
+    logger.info("No usable address on sales order; resolving customer default");
+  } else {
+    logger.info(
+      "Sales order address is incomplete (addressee / address_line_3 / city / postcode); " +
+      "checking customer default for potential replacement"
+    );
+  }
 
-  // --- Resolve the customer's default address ------------------------------
-  // Identical mapping + search approach to the split script.
+  // -------------------------------------------------------------------------
+  // Resolve the customer's default address (shared lookup logic)
+  // -------------------------------------------------------------------------
   const customerUuid = _.get(data, "customer.uuid");
   if (!customerUuid) {
     logger.warn("No customer on transaction; cannot resolve a default address");
@@ -61,15 +81,15 @@ const handle = async (providedData) => {
       countryCode = _.get(address, "country.code");
     }
     return {
-      addressee: _.get(address, "addressee"),
-      attention: _.get(address, "attention"),
+      addressee:     _.get(address, "addressee"),
+      attention:     _.get(address, "attention"),
       address_line_1: _.get(address, "address_line_1"),
       address_line_2: _.get(address, "address_line_2"),
       address_line_3: _.get(address, "address_line_3"),
-      city: _.get(address, "city"),
-      state: _.get(address, "state"),
-      postcode: _.get(address, "postcode"),
-      country_code: countryCode,
+      city:          _.get(address, "city"),
+      state:         _.get(address, "state"),
+      postcode:      _.get(address, "postcode"),
+      country_code:  countryCode,
     };
   };
 
@@ -84,9 +104,7 @@ const handle = async (providedData) => {
   // Primary lookup: Address model filtered by customer.
   const addressSearch = await Zudello.search({
     model: "Address",
-    filter: {
-      customer__uuid: customerUuid,
-    },
+    filter: { customer__uuid: customerUuid },
     select: [
       "uuid",
       "addressee",
@@ -135,48 +153,81 @@ const handle = async (providedData) => {
 
   if (!customerDefaultAddress) {
     logger.warn(
-      "No address found for customer " +
-        customerUuid +
-        "; nothing to default",
+      "No address found for customer " + customerUuid + "; nothing to default",
     );
     return;
   }
 
   logger.info("Customer default address", customerDefaultAddress);
 
-  // --- Build the header update --------------------------------------------
-  // Only set fields the customer default actually provides; keep header
-  // values for anything the default is missing.
+  // -------------------------------------------------------------------------
+  // Case 2: header already has address_line_1 — compare with customer default
+  // -------------------------------------------------------------------------
+  if (headerHasIncompleteAddress) {
+    const headerLine1  = String(_.get(data, "address_line_1") || "").trim().toLowerCase();
+    const defaultLine1 = String(_.get(customerDefaultAddress, "address_line_1") || "").trim().toLowerCase();
+
+    if (headerLine1 !== defaultLine1) {
+      logger.info(
+        "Header address_line_1 does not match customer default address_line_1; no update applied",
+      );
+      return;
+    }
+
+    logger.info(
+      "Header address_line_1 matches customer default; replacing entire address with customer default",
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // Build the header update
+  //
+  // Case 1 (missing address_line_1): merge customer default with existing
+  //   header values so any partial data already present is preserved.
+  // Case 2 (incomplete but line 1 matched): replace entirely with the
+  //   customer default — no fallback to the existing header values.
+  // -------------------------------------------------------------------------
+  let addressFields;
+
+  if (headerMissingAddress) {
+    // Merge: customer default takes priority; keep existing header value as
+    // fallback for any field the customer default does not supply.
+    addressFields = {
+      addressee:      _.get(customerDefaultAddress, "addressee")      || _.get(data, "addressee"),
+      attention:      _.get(customerDefaultAddress, "attention")      || _.get(data, "attention"),
+      address_line_1: _.get(customerDefaultAddress, "address_line_1") || _.get(data, "address_line_1"),
+      address_line_2: _.get(customerDefaultAddress, "address_line_2") || _.get(data, "address_line_2"),
+      address_line_3: _.get(customerDefaultAddress, "address_line_3") || _.get(data, "address_line_3"),
+      city:           _.get(customerDefaultAddress, "city")           || _.get(data, "city"),
+      state:          _.get(customerDefaultAddress, "state")          || _.get(data, "state"),
+      postcode:       _.get(customerDefaultAddress, "postcode")       || _.get(data, "postcode"),
+    };
+  } else {
+    // Full replacement: use customer default values only.
+    addressFields = {
+      addressee:      _.get(customerDefaultAddress, "addressee"),
+      attention:      _.get(customerDefaultAddress, "attention"),
+      address_line_1: _.get(customerDefaultAddress, "address_line_1"),
+      address_line_2: _.get(customerDefaultAddress, "address_line_2"),
+      address_line_3: _.get(customerDefaultAddress, "address_line_3"),
+      city:           _.get(customerDefaultAddress, "city"),
+      state:          _.get(customerDefaultAddress, "state"),
+      postcode:       _.get(customerDefaultAddress, "postcode"),
+    };
+  }
+
   const resolvedCountryCode =
     _.get(customerDefaultAddress, "country_code") ||
-    _.get(data, "country.code");
+    (headerMissingAddress ? _.get(data, "country.code") : null);
 
   const headerUpdate = {
     model: "Transaction",
     data: {
       uuid: uuid,
-      addressee:
-        _.get(customerDefaultAddress, "addressee") || _.get(data, "addressee"),
-      attention:
-        _.get(customerDefaultAddress, "attention") || _.get(data, "attention"),
-      address_line_1:
-        _.get(customerDefaultAddress, "address_line_1") ||
-        _.get(data, "address_line_1"),
-      address_line_2:
-        _.get(customerDefaultAddress, "address_line_2") ||
-        _.get(data, "address_line_2"),
-      address_line_3:
-        _.get(customerDefaultAddress, "address_line_3") ||
-        _.get(data, "address_line_3"),
-      city: _.get(customerDefaultAddress, "city") || _.get(data, "city"),
-      state: _.get(customerDefaultAddress, "state") || _.get(data, "state"),
-      postcode:
-        _.get(customerDefaultAddress, "postcode") || _.get(data, "postcode"),
+      ...addressFields,
       country: resolvedCountryCode && {
         fetch: true,
-        data: {
-          code: resolvedCountryCode,
-        },
+        data: { code: resolvedCountryCode },
       },
     },
     enrich: false,
@@ -194,7 +245,7 @@ const handle = async (providedData) => {
   if (result?.success) {
     const zudStatus = _.get(result, "data.status");
     if (zudStatus === "partial" || zudStatus === "failure") {
-      const resources = _.get(result, "data.resources", []);
+      const resources      = _.get(result, "data.resources", []);
       const failedResources = resources.filter((resource) => !resource.success);
       logger.error("Failed resources:", failedResources);
     }
