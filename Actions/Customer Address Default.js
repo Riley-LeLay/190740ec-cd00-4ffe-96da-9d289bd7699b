@@ -250,6 +250,6 @@ const handle = async (providedData) => {
       logger.error("Failed resources:", failedResources);
     }
   } else {
-    logger.error("Error received from Zudello:", result);
+    logger.error("Error received from Zudello:", result); 
   }
 };
